@@ -73,24 +73,45 @@ openai_client = AsyncOpenAI(
 # プロンプト
 # ==================================================
 
-BASE_PROMPT: Final[str] = """
-あなたは「カーニボアAI」です。
-Discordコミュニティ内で、一般的な質問から健康・栄養・代謝の質問まで
-自然な日本語で回答します。
-
-【共通ルール】
-・回答本文はリンクを除いて必ず300字以内
-・自然な2〜3文で回答する
+STYLE_RULES: Final[str] = """
+【話し方】
+・中学生でも分かる、短く自然な日本語で答える
+・難しい専門用語は、使った直後に短く言い換える
+・説明は身近なたとえを優先する
+・少しだけ皮肉やユーモアを混ぜてよい
+・ただし、質問者や特定の人を馬鹿にしない
+・医療上の危険を軽く扱う冗談はしない
+・偉そうな講義口調、論文調、役所の文章を避ける
+・「要するに」「つまり」を使い、核心から答える
+・回答本文はリンクを除いて300字以内
+・自然な2〜3文だけで答える
 ・見出し、箇条書き、番号、長い前置きは使わない
-・質問へ直接答え、同じ説明を繰り返さない
-・曖昧な質問でも長い確認項目を並べず、最も自然な意味で答える
-・分からないことを作らない
+・同じ説明を繰り返さない
 """.strip()
 
-RESEARCH_PROMPT: Final[str] = """
+
+BASE_PROMPT: Final[str] = f"""
+あなたは「カーニボアAI」です。
+Discordコミュニティ内で、一般的な質問から健康・栄養・代謝の質問まで、
+親しみやすく回答します。
+
+{STYLE_RULES}
+
+【共通ルール】
+・質問へ直接答える
+・曖昧な質問でも長い確認項目を並べず、最も自然な意味で答える
+・分からないことを作らない
+・返信元の投稿が提示されている場合は、その内容を読んで答える
+・質問が軽い雑談なら、検索したふりや研究の話を持ち出さない
+""".strip()
+
+
+RESEARCH_PROMPT: Final[str] = f"""
 あなたは「カーニボアAI」です。
 カーニボア、ケトジェニック、低糖質、人類進化、代謝医学に強い
 リサーチAIとして回答してください。
+
+{STYLE_RULES}
 
 【調査方針】
 ・質問に最も直接関係する最新のWeb情報を検索する
@@ -103,20 +124,19 @@ RESEARCH_PROMPT: Final[str] = """
 ・存在しない論文、著者、DOI、数値、URLを作らない
 
 【カーニボアの視点】
-・高糖質の混合食で得られた結果を、カーニボアへ無条件に当てはめない
-・背景食、糖質摂取量、インスリン抵抗性、体重変化、エネルギー摂取量、
+・高糖質の混合食で得られた結果を、カーニボアへそのまま貼り付けない
+・背景食、糖質量、インスリン抵抗性、体重変化、エネルギー摂取量、
   ApoB、LDL-P、TG/HDL比、既往歴、家族歴などを必要に応じて考慮する
 ・カーニボアを直接検証していない研究は、その点を短く明示する
-・カーニボア側の文脈を組み込むが、都合のよい証拠だけを選ばない
+・カーニボア側の文脈を入れるが、都合のよい証拠だけを選ばない
 
 【回答の絶対ルール】
-・本文はリンクを除いて必ず300字以内
-・自然な2〜3文だけで答える
-・見出し、箇条書き、番号、参考文献一覧を作らない
-・最も重要なエビデンスの要点だけを書く
+・難しい研究用語を並べず、結論を日常語で説明する
+・専門用語が必要なら、直後に一言で意味を補う
 ・本文中にURLを書かない
 ・出典は最も関連性が高いものを1〜2件だけ選ぶ
-・長い確認質問や選択肢一覧を出さない
+・参考文献一覧や長い注意書きを作らない
+・返信元の投稿が提示されている場合は、その内容を読んで答える
 """.strip()
 
 
@@ -190,12 +210,97 @@ def needs_research(question: str) -> bool:
 
 
 # ==================================================
-# 共通処理
+# 返信元メッセージ
 # ==================================================
 
 
 def remove_bot_mention(content: str, bot_user_id: int) -> str:
     return re.sub(rf"<@!?{bot_user_id}>", "", content).strip()
+
+
+async def get_replied_message_context(
+    message: discord.Message,
+) -> str | None:
+    reference = message.reference
+
+    if reference is None or reference.message_id is None:
+        return None
+
+    replied_message: discord.Message | None = None
+
+    if isinstance(reference.resolved, discord.Message):
+        replied_message = reference.resolved
+
+    if replied_message is None:
+        try:
+            replied_message = await message.channel.fetch_message(
+                reference.message_id
+            )
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException,
+            AttributeError,
+        ):
+            logger.warning(
+                "返信元メッセージを取得できませんでした: message_id=%s",
+                reference.message_id,
+            )
+            return None
+
+    content = replied_message.content.strip()
+
+    if not content and replied_message.embeds:
+        embed_parts: list[str] = []
+
+        for embed in replied_message.embeds:
+            if embed.title:
+                embed_parts.append(embed.title)
+
+            if embed.description:
+                embed_parts.append(embed.description)
+
+            for field in embed.fields:
+                embed_parts.append(
+                    f"{field.name}: {field.value}"
+                )
+
+        content = "\n".join(embed_parts).strip()
+
+    if not content and replied_message.attachments:
+        content = "添付ファイル: " + "、".join(
+            attachment.filename
+            for attachment in replied_message.attachments
+        )
+
+    if not content:
+        return None
+
+    if len(content) > 4000:
+        content = content[:4000].rstrip() + "…"
+
+    return (
+        f"返信元の投稿者: {replied_message.author.display_name}\n"
+        f"返信元の内容:\n{content}"
+    )
+
+
+def build_question_with_reply_context(
+    question: str,
+    replied_context: str | None,
+) -> str:
+    if not replied_context:
+        return question
+
+    return (
+        f"{replied_context}\n\n"
+        f"この返信元を踏まえたユーザーの質問:\n{question}"
+    )
+
+
+# ==================================================
+# 検索ツール・出典
+# ==================================================
 
 
 def build_research_tools() -> list[dict[str, Any]]:
@@ -224,9 +329,13 @@ def clean_source_url(url: str) -> str:
         parts = urlsplit(url)
         filtered_query = [
             (key, value)
-            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            for key, value in parse_qsl(
+                parts.query,
+                keep_blank_values=True,
+            )
             if not key.lower().startswith("utm_")
         ]
+
         return urlunsplit(
             (
                 parts.scheme,
@@ -250,10 +359,16 @@ def add_citation(
         return
 
     cleaned_url = clean_source_url(url)
+
     if not cleaned_url or cleaned_url in seen_urls:
         return
 
-    cleaned_title = re.sub(r"\s+", " ", title or "").strip()
+    cleaned_title = re.sub(
+        r"\s+",
+        " ",
+        title or "",
+    ).strip()
+
     if not cleaned_title:
         cleaned_title = urlsplit(cleaned_url).netloc or "出典"
 
@@ -275,8 +390,16 @@ def collect_citations_from_object(
         return
 
     for content_item in getattr(obj, "content", []) or []:
-        for annotation in getattr(content_item, "annotations", []) or []:
-            if getattr(annotation, "type", "") != "url_citation":
+        for annotation in getattr(
+            content_item,
+            "annotations",
+            [],
+        ) or []:
+            if getattr(
+                annotation,
+                "type",
+                "",
+            ) != "url_citation":
                 continue
 
             add_citation(
@@ -292,7 +415,12 @@ def collect_citations_from_event(
     citations: list[WebCitation],
     seen_urls: set[str],
 ) -> None:
-    for attr_name in ("item", "output_item", "part", "response"):
+    for attr_name in (
+        "item",
+        "output_item",
+        "part",
+        "response",
+    ):
         collect_citations_from_object(
             getattr(event, attr_name, None),
             citations,
@@ -300,12 +428,18 @@ def collect_citations_from_event(
         )
 
 
-def collect_urls_from_text(text: str) -> tuple[WebCitation, ...]:
+def collect_urls_from_text(
+    text: str,
+) -> tuple[WebCitation, ...]:
     found: list[WebCitation] = []
     seen_urls: set[str] = set()
 
-    for raw_url in re.findall(r"https?://[^\s)>\]}]+", text):
+    for raw_url in re.findall(
+        r"https?://[^\s)>\]}]+",
+        text,
+    ):
         url = raw_url.rstrip(".,、。")
+
         add_citation(
             found,
             seen_urls,
@@ -316,23 +450,35 @@ def collect_urls_from_text(text: str) -> tuple[WebCitation, ...]:
     return tuple(found)
 
 
+# ==================================================
+# 回答整形
+# ==================================================
+
+
 def strip_links_and_formatting(text: str) -> str:
     cleaned = text
 
-    # Markdownリンクと生URLを除去
     cleaned = re.sub(
         r"\s*\[[^\]]*\]\(https?://[^)]+\)",
         "",
         cleaned,
     )
-    cleaned = re.sub(r"https?://[^\s)>\]}]+", "", cleaned)
-
-    # 見出し・リスト記号を除去
-    cleaned = re.sub(r"【[^】\n]{1,40}】", "", cleaned)
+    cleaned = re.sub(
+        r"https?://[^\s)>\]}]+",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"【[^】\n]{1,40}】",
+        "",
+        cleaned,
+    )
 
     lines: list[str] = []
+
     for raw_line in cleaned.splitlines():
         line = raw_line.strip()
+
         if not line:
             continue
 
@@ -343,14 +489,22 @@ def strip_links_and_formatting(text: str) -> str:
         ):
             continue
 
-        line = re.sub(r"^(?:[-•*]|\d+[.)、])\s*", "", line)
+        line = re.sub(
+            r"^(?:[-•*]|\d+[.)、])\s*",
+            "",
+            line,
+        )
         lines.append(line)
 
     cleaned = " ".join(lines)
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = re.sub(r"\(\s*\)", "", cleaned)
     cleaned = re.sub(r"（\s*）", "", cleaned)
-    cleaned = re.sub(r"\s+([、。！？!?])", r"\1", cleaned)
+    cleaned = re.sub(
+        r"\s+([、。！？!?])",
+        r"\1",
+        cleaned,
+    )
 
     return cleaned.strip()
 
@@ -358,7 +512,10 @@ def strip_links_and_formatting(text: str) -> str:
 def split_sentences(text: str) -> list[str]:
     return [
         sentence.strip()
-        for sentence in re.findall(r".+?(?:[。！？!?]|$)", text)
+        for sentence in re.findall(
+            r".+?(?:[。！？!?]|$)",
+            text,
+        )
         if sentence.strip()
     ]
 
@@ -369,9 +526,10 @@ def fit_complete_sentences(
     max_sentences: int = 3,
 ) -> str:
     """
-    文章の途中では切らず、完結した文だけを300字以内に収める。
+    文の途中では切らず、完成した2〜3文を300字以内に収める。
     """
     sentences = split_sentences(text)
+
     if not sentences:
         return ""
 
@@ -391,9 +549,9 @@ def fit_complete_sentences(
     if selected:
         return "".join(selected).strip()
 
-    # 最初の1文自体が300字を超える異常ケースだけ、安全に短縮
     first = sentences[0]
     candidate = first[:limit]
+
     punctuation_position = max(
         candidate.rfind("。"),
         candidate.rfind("！"),
@@ -403,22 +561,39 @@ def fit_complete_sentences(
     )
 
     if punctuation_position >= 80:
-        return candidate[: punctuation_position + 1].strip()
+        return candidate[
+            : punctuation_position + 1
+        ].strip()
 
     return candidate[: limit - 1].rstrip("、, ") + "…"
 
 
 def compact_body(text: str) -> str:
     cleaned = strip_links_and_formatting(text)
-    return fit_complete_sentences(cleaned)
+
+    return fit_complete_sentences(
+        cleaned,
+        limit=BODY_CHAR_LIMIT,
+        max_sentences=3,
+    )
 
 
-def shorten_title(title: str, limit: int = 55) -> str:
-    title = re.sub(r"\s+", " ", title).strip()
+def shorten_title(
+    title: str,
+    limit: int = 55,
+) -> str:
+    title = re.sub(
+        r"\s+",
+        " ",
+        title,
+    ).strip()
+
     if not title:
         return "出典"
+
     if len(title) <= limit:
         return title
+
     return title[: limit - 1].rstrip() + "…"
 
 
@@ -430,18 +605,26 @@ def format_final_answer(
     body = compact_body(raw_text)
 
     if not body:
-        raise RuntimeError("OpenAIから回答本文を取得できませんでした。")
+        raise RuntimeError(
+            "OpenAIから回答本文を取得できませんでした。"
+        )
 
     selected: tuple[WebCitation, ...] = ()
 
     if include_sources:
-        selected = tuple(citations[:MAX_LINKS])
+        selected = tuple(
+            citations[:MAX_LINKS]
+        )
+
         if not selected:
-            selected = collect_urls_from_text(raw_text)[:MAX_LINKS]
+            selected = collect_urls_from_text(
+                raw_text
+            )[:MAX_LINKS]
 
     if selected:
         links = "\n".join(
-            f"[{shorten_title(citation.title)}]({citation.url})"
+            f"[{shorten_title(citation.title)}]"
+            f"({citation.url})"
             for citation in selected
         )
         final_text = f"{body}\n\n{links}"
@@ -471,7 +654,11 @@ async def ask_carnivore_ai(
         "input": [
             {
                 "role": "developer",
-                "content": RESEARCH_PROMPT if research_mode else BASE_PROMPT,
+                "content": (
+                    RESEARCH_PROMPT
+                    if research_mode
+                    else BASE_PROMPT
+                ),
             },
             {
                 "role": "user",
@@ -482,18 +669,30 @@ async def ask_carnivore_ai(
     }
 
     if research_mode:
-        request["reasoning"] = {"effort": "low"}
-        request["tools"] = build_research_tools()
+        request["reasoning"] = {
+            "effort": "low"
+        }
+        request["tools"] = (
+            build_research_tools()
+        )
 
         if OPENAI_VECTOR_STORE_ID:
-            request["include"] = ["file_search_call.results"]
+            request["include"] = [
+                "file_search_call.results"
+            ]
 
-    stream = await openai_client.responses.create(**request)
+    stream = await openai_client.responses.create(
+        **request
+    )
 
     raw_text = ""
 
     async for event in stream:
-        event_type = getattr(event, "type", "")
+        event_type = getattr(
+            event,
+            "type",
+            "",
+        )
 
         if research_mode:
             collect_citations_from_event(
@@ -502,25 +701,50 @@ async def ask_carnivore_ai(
                 seen_urls,
             )
 
-        if event_type == "response.output_text.delta":
-            delta = getattr(event, "delta", "")
+        if event_type == (
+            "response.output_text.delta"
+        ):
+            delta = getattr(
+                event,
+                "delta",
+                "",
+            )
+
             if delta:
                 raw_text += delta
 
         elif event_type == "response.failed":
-            response_obj = getattr(event, "response", None)
-            error = getattr(response_obj, "error", None)
+            response_obj = getattr(
+                event,
+                "response",
+                None,
+            )
+            error = getattr(
+                response_obj,
+                "error",
+                None,
+            )
+
             raise RuntimeError(
-                f"OpenAI response failed: {error or response_obj}"
+                f"OpenAI response failed: "
+                f"{error or response_obj}"
             )
 
         elif event_type == "error":
             raise RuntimeError(
-                str(getattr(event, "message", "OpenAI stream error"))
+                str(
+                    getattr(
+                        event,
+                        "message",
+                        "OpenAI stream error",
+                    )
+                )
             )
 
     if not raw_text.strip():
-        raise RuntimeError("OpenAIから回答本文を取得できませんでした。")
+        raise RuntimeError(
+            "OpenAIから回答本文を取得できませんでした。"
+        )
 
     return format_final_answer(
         raw_text=raw_text,
@@ -537,7 +761,8 @@ async def ask_carnivore_ai(
 @bot.event
 async def on_ready() -> None:
     logger.info(
-        "Logged in as %s (%s) | model=%s | vector_store=%s",
+        "Logged in as %s (%s) | "
+        "model=%s | vector_store=%s",
         bot.user,
         bot.user.id if bot.user else "?",
         OPENAI_MODEL,
@@ -554,7 +779,9 @@ async def on_ready() -> None:
 
 
 @bot.event
-async def on_message(message: discord.Message) -> None:
+async def on_message(
+    message: discord.Message,
+) -> None:
     if message.author.bot or bot.user is None:
         return
 
@@ -567,51 +794,80 @@ async def on_message(message: discord.Message) -> None:
         bot.user.id,
     )
 
-    if not question:
-        await message.reply(
-            f"質問を書いてください。例：`{bot.user.mention} 卵とコレステロールについて`",
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
+    replied_context = (
+        await get_replied_message_context(
+            message
         )
-        return
-
-    research_mode = needs_research(question)
-
-    status_text = (
-        "🔎 関連する研究を調べています…"
-        if research_mode
-        else "💭 回答を考えています…"
     )
 
-    status_message: discord.Message | None = None
+    if not question:
+        if replied_context:
+            question = (
+                "この内容について、"
+                "要点を踏まえて回答してください。"
+            )
+        else:
+            await message.reply(
+                "質問を書いてください。"
+                f"例：`{bot.user.mention} "
+                "卵とコレステロールについて`",
+                mention_author=False,
+                allowed_mentions=(
+                    discord.AllowedMentions.none()
+                ),
+            )
+            return
+
+    complete_question = (
+        build_question_with_reply_context(
+            question=question,
+            replied_context=replied_context,
+        )
+    )
+
+    research_mode = needs_research(
+        complete_question
+    )
+
+    status_message: (
+        discord.Message | None
+    ) = None
 
     try:
-        # 生成途中の文章をDiscordへ何度も表示すると、
-        # 文章の途中で止まったように見えるため、状態表示だけを出す。
+        # 全質問で同じ待機表示。
+        # 内部ではストリーミング受信し、
+        # 完成後にこのメッセージを回答へ置き換える。
         status_message = await message.reply(
-            status_text,
+            "💭 回答を考えています…",
             mention_author=False,
             suppress_embeds=True,
-            allowed_mentions=discord.AllowedMentions.none(),
+            allowed_mentions=(
+                discord.AllowedMentions.none()
+            ),
         )
 
         answer = await ask_carnivore_ai(
-            question=question,
+            question=complete_question,
             research_mode=research_mode,
         )
 
         await status_message.edit(
             content=answer.text,
             suppress=True,
-            allowed_mentions=discord.AllowedMentions.none(),
+            allowed_mentions=(
+                discord.AllowedMentions.none()
+            ),
         )
 
     except Exception:
-        logger.exception("Carnivore AI request failed")
+        logger.exception(
+            "Carnivore AI request failed"
+        )
 
         error_text = (
             "回答生成中にエラーが発生しました。"
-            "少し待ってから、もう一度試してください。"
+            "少し待ってから、"
+            "もう一度試してください。"
         )
 
         if status_message is not None:
@@ -619,23 +875,32 @@ async def on_message(message: discord.Message) -> None:
                 await status_message.edit(
                     content=error_text,
                     suppress=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    allowed_mentions=(
+                        discord.AllowedMentions.none()
+                    ),
                 )
             except discord.HTTPException:
                 await message.reply(
                     error_text,
                     mention_author=False,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    allowed_mentions=(
+                        discord.AllowedMentions.none()
+                    ),
                 )
         else:
             await message.reply(
                 error_text,
                 mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none(),
+                allowed_mentions=(
+                    discord.AllowedMentions.none()
+                ),
             )
 
     await bot.process_commands(message)
 
 
 if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN, log_handler=None)
+    bot.run(
+        DISCORD_TOKEN,
+        log_handler=None,
+    )
