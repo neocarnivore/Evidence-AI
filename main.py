@@ -198,6 +198,89 @@ def remove_bot_mention(content: str, bot_user_id: int) -> str:
     return re.sub(rf"<@!?{bot_user_id}>", "", content).strip()
 
 
+async def get_replied_message_context(
+    message: discord.Message,
+) -> str | None:
+    """
+    Discordの返信機能で参照されている元メッセージを取得する。
+    キャッシュにない場合はDiscord APIから読み込む。
+    """
+    reference = message.reference
+    if reference is None or reference.message_id is None:
+        return None
+
+    referenced_message: discord.Message | None = None
+
+    if isinstance(reference.resolved, discord.Message):
+        referenced_message = reference.resolved
+
+    if referenced_message is None:
+        try:
+            referenced_message = await message.channel.fetch_message(
+                reference.message_id
+            )
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException,
+            AttributeError,
+        ):
+            logger.warning(
+                "返信元メッセージを取得できませんでした: message_id=%s",
+                reference.message_id,
+            )
+            return None
+
+    content = referenced_message.content.strip()
+
+    if not content and referenced_message.embeds:
+        embed_parts: list[str] = []
+
+        for embed in referenced_message.embeds:
+            if embed.title:
+                embed_parts.append(embed.title)
+            if embed.description:
+                embed_parts.append(embed.description)
+
+            for field in embed.fields:
+                embed_parts.append(f"{field.name}: {field.value}")
+
+        content = "\n".join(embed_parts).strip()
+
+    if not content and referenced_message.attachments:
+        content = "添付ファイル: " + "、".join(
+            attachment.filename
+            for attachment in referenced_message.attachments
+        )
+
+    if not content:
+        return None
+
+    author_name = referenced_message.author.display_name
+
+    # 長大な返信元によるAPI負荷を抑える
+    if len(content) > 4000:
+        content = content[:4000].rstrip() + "…"
+
+    return (
+        f"返信元の投稿者: {author_name}\n"
+        f"返信元の内容:\n{content}"
+    )
+
+
+def build_question_with_reply_context(
+    question: str,
+    replied_context: str | None,
+) -> str:
+    if not replied_context:
+        return question
+
+    return (
+        f"{replied_context}\n\n"
+        f"この返信元を踏まえたユーザーの質問:\n{question}"
+    )
+
+
 def build_research_tools() -> list[dict[str, Any]]:
     tools: list[dict[str, Any]] = [
         {
@@ -567,15 +650,25 @@ async def on_message(message: discord.Message) -> None:
         bot.user.id,
     )
 
-    if not question:
-        await message.reply(
-            f"質問を書いてください。例：`{bot.user.mention} 卵とコレステロールについて`",
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        return
+    replied_context = await get_replied_message_context(message)
 
-    research_mode = needs_research(question)
+    if not question:
+        if replied_context:
+            question = "この内容について、要点を踏まえて回答してください。"
+        else:
+            await message.reply(
+                f"質問を書いてください。例：`{bot.user.mention} 卵とコレステロールについて`",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+    complete_question = build_question_with_reply_context(
+        question=question,
+        replied_context=replied_context,
+    )
+
+    research_mode = needs_research(complete_question)
 
     status_text = (
         "🔎 関連する研究を調べています…"
@@ -596,7 +689,7 @@ async def on_message(message: discord.Message) -> None:
         )
 
         answer = await ask_carnivore_ai(
-            question=question,
+            question=complete_question,
             research_mode=research_mode,
         )
 
