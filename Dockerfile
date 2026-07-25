@@ -10,10 +10,9 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY pyproject.toml README.md ./
-COPY src ./src
-COPY supabase ./supabase
+COPY requirements.txt .
+RUN pip install -r requirements.txt
 
-RUN pip install .
+COPY . .
 
-CMD ["youtube-rag-bot"]
+CMD ["python", "main.py"]
